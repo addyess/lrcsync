@@ -31,6 +31,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -41,6 +42,7 @@ TICK_MS = 50
 AUDIO_EXTS = (".m4a", ".mp3", ".flac", ".wav", ".ogg", ".opus", ".aac", ".wma")
 LRCLIB = "https://lrclib.net"
 UA = "lrcsync/0.1 (personal use)"
+TS_LINE = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
 
 
 def die(msg):
@@ -51,7 +53,7 @@ def die(msg):
 def fmt_ts(seconds):
     """Format seconds as an LRC timestamp: [mm:ss.xx]."""
     if seconds is None:
-        return "  --:--.--"
+        return "--:--.--"
     # Quantise to centiseconds *before* splitting, or 119.999 renders as
     # the invalid "01:60.00" instead of "02:00.00".
     cs = round(max(0.0, seconds) * 100)
@@ -60,19 +62,31 @@ def fmt_ts(seconds):
     return f"{int(m):02d}:{int(s):02d}.{int(cs):02d}"
 
 
-def probe_duration(path):
+def probe(path):
+    """Read the duration and title/artist/album tags of an audio file."""
     ffprobe = shutil.which("ffprobe")
-    if not ffprobe:
-        return None
+    if not ffprobe or not path:
+        return None, {}
     try:
         out = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+            [ffprobe, "-v", "error", "-show_entries",
+             "format=duration:format_tags=title,artist,album,album_artist",
+             "-of", "json", str(path)],
             capture_output=True, text=True, timeout=15,
         )
-        return float(out.stdout.strip())
+        fmt = json.loads(out.stdout or "{}").get("format", {})
     except (ValueError, subprocess.SubprocessError):
-        return None
+        return None, {}
+    try:
+        duration = float(fmt.get("duration"))
+    except (TypeError, ValueError):
+        duration = None
+    low = {k.lower(): v for k, v in fmt.get("tags", {}).items()}
+    return duration, {
+        "ti": low.get("title", ""),
+        "ar": low.get("artist") or low.get("album_artist", ""),
+        "al": low.get("album", ""),
+    }
 
 
 def elide_middle(s, width):
@@ -96,29 +110,6 @@ def display_path(path):
     return rel if len(rel) <= len(str(path)) else str(path)
 
 
-def probe_tags(path):
-    """Read title/artist/album tags from the audio file."""
-    ffprobe = shutil.which("ffprobe")
-    if not ffprobe or not path:
-        return {}
-    try:
-        out = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries",
-             "format_tags=title,artist,album,album_artist",
-             "-of", "json", str(path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        tags = json.loads(out.stdout or "{}").get("format", {}).get("tags", {})
-    except (ValueError, subprocess.SubprocessError):
-        return {}
-    low = {k.lower(): v for k, v in tags.items()}
-    return {
-        "ti": low.get("title", ""),
-        "ar": low.get("artist") or low.get("album_artist", ""),
-        "al": low.get("album", ""),
-    }
-
-
 def resolve_inputs(audio_arg, lyrics_arg):
     """Given any one of the same-named files, find the rest of the set.
 
@@ -132,8 +123,7 @@ def resolve_inputs(audio_arg, lyrics_arg):
     if not anchor.exists():
         die(f"no such file: {anchor}")
 
-    base = anchor
-    if anchor.suffix.lower() == ".yaml" and anchor.name.endswith(".lyricsfile.yaml"):
+    if anchor.name.endswith(".lyricsfile.yaml"):
         base = anchor.parent / anchor.name[: -len(".lyricsfile.yaml")]
     else:
         base = anchor.with_suffix("")
@@ -146,8 +136,8 @@ def resolve_inputs(audio_arg, lyrics_arg):
                 audio = str(p)
                 break
 
-    lyrics = lyrics_arg if lyrics_arg and Path(lyrics_arg).suffix.lower() != "" \
-        and Path(lyrics_arg).suffix.lower() not in AUDIO_EXTS else None
+    lyrics = lyrics_arg if lyrics_arg and \
+        Path(lyrics_arg).suffix.lower() not in AUDIO_EXTS + ("",) else None
     if not lyrics:
         # An existing .lrc is preferred: it carries prior timings to edit.
         for cand in (str(base) + ".lrc", str(base) + ".txt"):
@@ -169,7 +159,6 @@ def _get(url, timeout=20):
 
 def lrclib_search(artist, title, album="", instance=LRCLIB):
     """Search LRCLIB, falling back to a looser full-text query."""
-    import urllib.parse as up
     tries = []
     if artist and title:
         p = {"artist_name": artist, "track_name": title}
@@ -184,7 +173,7 @@ def lrclib_search(artist, title, album="", instance=LRCLIB):
     merged, seen = [], set()
     for params in tries:
         try:
-            res = _get(f"{instance}/api/search?" + up.urlencode(params))
+            res = _get(f"{instance}/api/search?" + urllib.parse.urlencode(params))
         except Exception:
             continue
         for r in res or []:
@@ -268,23 +257,6 @@ def choose_result(results, duration=None, auto=False):
     return curses.wrapper(lambda scr: _picker(scr, ordered, duration))
 
 
-def pick_result(results, duration=None):
-    """Prefer synced lyrics, and a release whose duration matches the file."""
-    def close(r):
-        return duration and abs((r.get("duration") or 0) - duration) <= 3
-
-    synced = [r for r in results if r.get("syncedLyrics")]
-    plain = [r for r in results if r.get("plainLyrics") and not r.get("syncedLyrics")]
-    for pool, kind in ((synced, "synced"), (plain, "plain")):
-        if not pool:
-            continue
-        matched = [r for r in pool if close(r)] or pool
-        best = max(matched, key=lambda r: len(r.get("syncedLyrics") or
-                                              r.get("plainLyrics") or ""))
-        return best, kind
-    return None, None
-
-
 def fetch_lyrics(base, tags, duration, instance=LRCLIB, auto=False):
     """Download a lyrics source from LRCLIB for a track with no local file.
 
@@ -301,20 +273,18 @@ def fetch_lyrics(base, tags, duration, instance=LRCLIB, auto=False):
     if not best:
         return None, None, "cancelled at the picker", {}
     kind = "synced" if best.get("syncedLyrics") else "plain"
+    body = best.get("syncedLyrics") or best.get("plainLyrics")
     if kind == "synced":
         path = str(base) + ".lrc"
         head = "".join(
             f"[{k}:{best.get(v) or ''}]\n"
             for k, v in (("ar", "artistName"), ("ti", "trackName"),
                          ("al", "albumName")))
-        Path(path).write_text(head + best["syncedLyrics"].rstrip() + "\n",
-                              encoding="utf-8")
+        Path(path).write_text(head + body.rstrip() + "\n", encoding="utf-8")
     else:
         path = str(base) + ".txt"
-        Path(path).write_text(best["plainLyrics"].rstrip() + "\n",
-                              encoding="utf-8")
-    n = len([x for x in (best.get("syncedLyrics") or
-                         best.get("plainLyrics")).splitlines() if x.strip()])
+        Path(path).write_text(body.rstrip() + "\n", encoding="utf-8")
+    n = len([x for x in body.splitlines() if x.strip()])
     # Carry the chosen record's own naming forward. Publishing under these
     # values attaches to that record; publishing under a file tag that differs
     # (an "[Disc 3]" suffix, say) silently creates a separate entry instead.
@@ -496,10 +466,9 @@ def load_existing_stamps(lines, lrc_path):
     """Re-apply timestamps from an existing .lrc so work can be resumed."""
     if not Path(lrc_path).exists():
         return 0
-    pat = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
     entries = []
     for ln in Path(lrc_path).read_text(encoding="utf-8").splitlines():
-        m = pat.match(ln.strip())
+        m = TS_LINE.match(ln.strip())
         if m:
             mins, secs, text = m.groups()
             entries.append((int(mins) * 60 + float(secs), text.strip()))
@@ -525,10 +494,9 @@ def write_lrc(path, lines, meta, offset=0.0):
     for key in ("ar", "ti", "al", "length"):
         if meta.get(key):
             out.append(f"[{key}:{meta[key]}]")
-    for line in lines:
-        if line["blank"] or line["ts"] is None:
-            continue
-        out.append(f"[{fmt_ts(line['ts'] + offset)}] {line['text'].strip()}")
+    body = synced_body(lines, offset)
+    if body:
+        out.append(body)
     Path(path).write_text("\n".join(out) + "\n", encoding="utf-8")
     return sum(1 for l in lines if l["ts"] is not None)
 
@@ -581,7 +549,6 @@ def parse_lrc(lrc_path):
     """Read an .lrc directly into (lines, meta). Used by --from-lrc, where the
     .lrc is the sole source of both text and timings, so no text matching is
     needed and repeated lines cannot be confused."""
-    ts_pat = re.compile(r"^\[(\d+):(\d+(?:\.\d+)?)\]\s*(.*)$")
     meta_pat = re.compile(r"^\[(ar|ti|al|length):(.*)\]$")
     lines, meta, dropped = [], {}, 0
     for raw in Path(lrc_path).read_text(encoding="utf-8").splitlines():
@@ -590,7 +557,7 @@ def parse_lrc(lrc_path):
         if m:
             meta[m.group(1)] = m.group(2).strip()
             continue
-        m = ts_pat.match(raw)
+        m = TS_LINE.match(raw)
         if not m:
             continue
         text = m.group(3).strip()
@@ -882,7 +849,7 @@ class App:
             if line["blank"]:
                 scr.addnstr(y, 0, "   " + "-" * 8, w - 1, curses.A_DIM)
                 continue
-            ts = f"[{fmt_ts(line['ts'])}]" if line["ts"] is not None else "[  --:--.--]"
+            ts = f"[{fmt_ts(line['ts'])}]"
             marker = ">" if sel else " "
             text = line["text"].strip()
             body = f"{marker} {ts} {text}"
@@ -903,6 +870,17 @@ class App:
                     curses.color_pair(4) if self.pending else curses.A_NORMAL)
         scr.refresh()
 
+    def request_quit(self):
+        """True when it is safe to quit now; otherwise explain or ask."""
+        if self.upload_thread and self.upload_thread.is_alive():
+            self.status = "upload in progress - wait before quitting"
+        elif self.dirty:
+            self.pending = "quit"
+            self.status = "unsaved changes - press y to quit, n to stay"
+        else:
+            return True
+        return False
+
     # -- main loop ---------------------------------------------------------
     def run(self):
         curses.curs_set(0)
@@ -911,6 +889,21 @@ class App:
         # assemble into KEY_LEFT/KEY_RIGHT.
         self.scr.timeout(TICK_MS)
         self.scr.keypad(True)
+        keys = {
+            ord(" "): self.player.toggle,
+            curses.KEY_ENTER: self.stamp, 10: self.stamp, 13: self.stamp,
+            curses.KEY_LEFT: lambda: self.seek(-SEEK_SMALL),
+            curses.KEY_RIGHT: lambda: self.seek(SEEK_SMALL),
+            curses.KEY_SLEFT: lambda: self.seek(-SEEK_LARGE),
+            curses.KEY_SRIGHT: lambda: self.seek(SEEK_LARGE),
+            curses.KEY_UP: lambda: self.move_cursor(-1),
+            curses.KEY_DOWN: lambda: self.move_cursor(1),
+            curses.KEY_BACKSPACE: self.unstamp, 127: self.unstamp, 8: self.unstamp,
+            ord("w"): self.save,
+            ord("u"): self.upload,
+            ord("m"): self.edit_metadata,
+            ord("q"): self.request_quit,
+        }
         while True:
             self.player.poll_ended()
             self.draw()
@@ -935,41 +928,9 @@ class App:
                 self.status = "cancelled"
                 continue
 
-            if ch in (ord(" "),):
-                self.player.toggle()
-            elif ch in (curses.KEY_ENTER, 10, 13):
-                self.stamp()
-            elif ch == curses.KEY_LEFT:
-                self.seek(-SEEK_SMALL)
-            elif ch == curses.KEY_RIGHT:
-                self.seek(SEEK_SMALL)
-            elif ch == curses.KEY_SLEFT:
-                self.seek(-SEEK_LARGE)
-            elif ch == curses.KEY_SRIGHT:
-                self.seek(SEEK_LARGE)
-            elif ch == curses.KEY_UP:
-                self.move_cursor(-1)
-            elif ch == curses.KEY_DOWN:
-                self.move_cursor(1)
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                self.unstamp()
-            elif ch == ord("w"):
-                self.save()
-            elif ch == ord("u"):
-                self.upload()
-            elif ch == ord("m"):
-                self.edit_metadata()
-            elif ch == ord("q"):
-                if self.upload_thread and self.upload_thread.is_alive():
-                    self.status = "upload in progress - wait before quitting"
-                elif self.dirty:
-                    self.pending = "quit"
-                    self.status = "unsaved changes - press y to quit, n to stay"
-                else:
-                    break
-            elif ch == curses.KEY_RESIZE:
-                continue
-
+            action = keys.get(ch)
+            if action and action():
+                break
 
 def convert_from_lrc(args):
     """Emit a .lyricsfile.yaml straight from an existing .lrc."""
@@ -989,7 +950,7 @@ def convert_from_lrc(args):
         die("lyricsfile requires title and artist (pass --title/--artist)")
 
     if args.audio:
-        duration = probe_duration(args.audio)
+        duration, _ = probe(args.audio)
         if duration:
             meta["duration_ms"] = int(round(duration * 1000))
 
@@ -1038,16 +999,17 @@ def main():
     if not audio:
         die("no audio file found next to " + str(lyrics))
 
+    duration, tags = probe(audio)
     fetched_meta = {}
     if not lyrics and not args.no_fetch:
         # Bare audio file: pull a lyrics source from LRCLIB using its tags.
-        tags0 = probe_tags(audio)
+        query = dict(tags)
         for k, flag in (("ar", args.artist), ("ti", args.title), ("al", args.album)):
             if flag:
-                tags0[k] = flag
+                query[k] = flag
         base = Path(audio).with_suffix("")
         lyrics, kind, note, fetched_meta = fetch_lyrics(
-            base, tags0, probe_duration(audio), auto=args.auto)
+            base, query, duration, auto=args.auto)
         print(f"lrclib: {note}")
         if not lyrics:
             die("no lyrics source found; supply a .txt or use --title/--artist")
@@ -1074,8 +1036,6 @@ def main():
         resumed = load_existing_stamps(lines, out_path)
         plain = Path(lyrics).read_text(encoding="utf-8")
 
-    duration = probe_duration(audio)
-    tags = probe_tags(audio)
     # Precedence: explicit flags, then the LRCLIB record this came from, then
     # the .lrc's own tags, then the audio's tags. The fetched record outranks
     # the file tags so an upload attaches to that record rather than forking
