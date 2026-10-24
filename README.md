@@ -76,7 +76,7 @@ apart. A `=` marks a duration matching your file.
 | --- | --- |
 | `space` | play / pause |
 | `enter` | stamp the current line, advance |
-| `←` / `→` | seek 2s back / forward (`shift` for 5s) |
+| `←` / `→` | seek 2s back / forward (`shift` for 5s); the cursor jumps to the next line due from there |
 | `↑` / `↓` | move between lines |
 | `backspace` | clear the current line's stamp |
 | `w` | write output files |
@@ -106,6 +106,9 @@ a small constant startup latency. If playback consistently leads or lags:
 ```
 
 Press `w` again. Every stamp is shifted on write — no re-tapping.
+
+For a single late tap, press `←` instead: playback jumps back and the cursor
+moves up to the first line not yet sung at that point, so `enter` re-stamps it.
 
 ## Publishing
 

@@ -10,7 +10,7 @@ ffplay/ffprobe, which are already installed.
 
 Keys:
     space        play / pause
-    left/right   seek back / forward 2s (shift: 5s)
+    left/right   seek back / forward 2s (shift: 5s); the cursor follows
     up/down      move the cursor between lines
     enter        stamp the cursor line at the current position, advance
     backspace    clear the stamp on the cursor line
@@ -399,7 +399,7 @@ def synced_body(lines, offset=0.0):
 
 class Player:
     """Wraps ffplay. Position is tracked on a monotonic clock because ffplay
-    cannot report playhead position; seeking relaunches the process."""
+    cannot report playhead position; pausing and seeking relaunch the process."""
 
     def __init__(self, path, duration=None):
         self.path = str(path)
@@ -433,8 +433,6 @@ class Player:
     def _kill(self):
         if self.proc and self.proc.poll() is None:
             try:
-                # Resume first: a SIGSTOPped process will not act on SIGTERM.
-                os.kill(self.proc.pid, signal.SIGCONT)
                 os.kill(self.proc.pid, signal.SIGTERM)
                 self.proc.wait(timeout=2)
             except (ProcessLookupError, subprocess.TimeoutExpired):
@@ -449,40 +447,27 @@ class Player:
             self.play()
 
     def play(self):
-        if self.playing:
-            return
-        pos = self._base
-        if self.proc and self.proc.poll() is None:
-            try:
-                os.kill(self.proc.pid, signal.SIGCONT)
-                self._t0 = time.monotonic()
-                self.playing = True
-                return
-            except ProcessLookupError:
-                pass
-        self._spawn(pos)
+        if not self.playing:
+            self._spawn(self._base)
 
     def pause(self):
+        # Kill rather than SIGSTOP: a stopped ffplay leaves CoreAudio looping
+        # its last buffer, which is heard as a stutter.
         if not self.playing:
             return
         self._base = self.position()
+        self._kill()
         self.playing = False
-        self._t0 = None
-        if self.proc and self.proc.poll() is None:
-            try:
-                os.kill(self.proc.pid, signal.SIGSTOP)
-            except ProcessLookupError:
-                self.proc = None
 
     def seek(self, delta):
         target = self.position() + delta
         if self.duration is not None:
             target = min(target, max(0.0, self.duration - 0.1))
         target = max(0.0, target)
-        was_playing = self.playing
-        self._spawn(target)
-        if not was_playing:
-            self.pause()
+        if self.playing:
+            self._spawn(target)
+        else:
+            self._base = target
 
     def poll_ended(self):
         """True once playback has run past the end of the file."""
@@ -688,6 +673,18 @@ class App:
         else:
             pos = 0
         self.cursor = idxs[pos]
+
+    def seek(self, delta):
+        """Seek, then put the cursor on the first line not yet sung by the new
+        position, so a late tap can be redone by seeking back and re-stamping."""
+        self.player.seek(delta)
+        pos = self.player.position()
+        idxs = self.stampable()
+        if idxs:
+            self.cursor = next(
+                (i for i in idxs
+                 if self.lines[i]["ts"] is None or self.lines[i]["ts"] > pos),
+                idxs[-1])
 
     def stamp(self):
         line = self.lines[self.cursor]
@@ -943,13 +940,13 @@ class App:
             elif ch in (curses.KEY_ENTER, 10, 13):
                 self.stamp()
             elif ch == curses.KEY_LEFT:
-                self.player.seek(-SEEK_SMALL)
+                self.seek(-SEEK_SMALL)
             elif ch == curses.KEY_RIGHT:
-                self.player.seek(SEEK_SMALL)
+                self.seek(SEEK_SMALL)
             elif ch == curses.KEY_SLEFT:
-                self.player.seek(-SEEK_LARGE)
+                self.seek(-SEEK_LARGE)
             elif ch == curses.KEY_SRIGHT:
-                self.player.seek(SEEK_LARGE)
+                self.seek(SEEK_LARGE)
             elif ch == curses.KEY_UP:
                 self.move_cursor(-1)
             elif ch == curses.KEY_DOWN:
